@@ -36,22 +36,12 @@ function hasWS(s) {
 
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-/** `text` with & < > " and ' escaped (fast path when nothing needs it). */
+/** `text` with & < > " and ' escaped (fast path when nothing needs it;
+ * the replace scans in C++ and only the matches cost a call). */
 const ESC_RE = /[&<>"']/;
 function esc(text) {
   if (!ESC_RE.test(text)) return text;
-  const out = [];
-  let last = 0;
-  for (let i = 0; i < text.length; i++) {
-    const e = ESC[text[i]];
-    if (e !== undefined) {
-      if (i > last) out.push(text.slice(last, i));
-      out.push(e);
-      last = i + 1;
-    }
-  }
-  if (last < text.length) out.push(text.slice(last));
-  return out.join('');
+  return text.replace(/[&<>"']/g, (c) => ESC[c]);
 }
 
 
@@ -379,8 +369,12 @@ function isHR(line) {
   return line.length >= 3;
 }
 
-/** A line trimmed of spaces and tabs at both ends. */
+/** A line trimmed of spaces and tabs at both ends (unchanged when it holds
+ * neither at either end, which is most lines: no slice is made then). */
 function trimLine(line) {
+  const a0 = line.charCodeAt(0);
+  const b0 = line.charCodeAt(line.length - 1);
+  if ((a0 !== 32 && a0 !== 9) && (b0 !== 32 && b0 !== 9)) return line;
   let a = 0;
   let b = line.length;
   while (a < b) {
@@ -500,24 +494,50 @@ function hasScheme(target) {
 
 /** A link target's href, resolving relative paths against the source's directory. */
 function linkTarget(target, cx, dir, srcPath) {
-  if (hasScheme(target) || target[0] === '/' || target[0] === '#') return target;
+  // Relative links repeat across a site: the resolved href is cached per
+  // (directory, target). The broken-link report is a set, so an entry
+  // recorded on the first computation stays recorded on a cache hit.
+  let byDir = cx.linkCache.get(dir);
+  if (byDir === undefined) {
+    byDir = new Map();
+    cx.linkCache.set(dir, byDir);
+  }
+  const hit = byDir.get(target);
+  if (hit !== undefined) {
+    // The href is cached, but the broken-link line names this source, so
+    // it is recorded again on every broken hit, exactly as uncached.
+    if (hit.broken) cx.broken.add(`broken-link ${srcPath} -> ${target}`);
+    return hit.href;
+  }
+  const found = linkTargetSlow(target, cx, dir, srcPath);
+  byDir.set(target, found);
+  if (found.broken) cx.broken.add(`broken-link ${srcPath} -> ${target}`);
+  return found.href;
+}
+
+/** A link target's href, uncached: { href, broken }. */
+function linkTargetSlow(target, cx, dir, srcPath) {
+  if (hasScheme(target) || target[0] === '/' || target[0] === '#') return { href: target, broken: false };
   const hash = target.indexOf('#');
   const rel = hash === -1 ? target : target.slice(0, hash);
   const frag = hash === -1 ? '' : target.slice(hash);
   const path = rel === '' ? null : resolvePath(dir, rel);
   if (path !== null) {
     const page = cx.bySource.get(path);
-    if (page !== undefined) return `${page.url}${frag}`;
-    if (cx.staticPaths.has(path)) return `${cx.base}/${path}${frag}`;
+    if (page !== undefined) return { href: `${page.url}${frag}`, broken: false };
+    if (cx.staticPaths.has(path)) return { href: `${cx.base}/${path}${frag}`, broken: false };
   }
-  cx.broken.add(`broken-link ${srcPath} -> ${target}`);
-  return target;
+  return { href: target, broken: true };
 }
 
 /** `s` rendered inline; links resolve through the build context.
  * A native scan jumps from one markup character to the next; the plain
  * text between them moves in whole slices. */
 const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
+/** The same set, without /g, for testing whether a nested span needs a
+ * recursive render at all (a span with no markup character in it renders
+ * as itself). */
+const INLINE_TEST = /[\\`*\[&<>"']/;
 function inline(s, cx, dir, srcPath) {
   const out = [];
   let i = 0;
@@ -526,8 +546,8 @@ function inline(s, cx, dir, srcPath) {
   for (;;) {
     INLINE_SPECIAL.lastIndex = i;
     const m = INLINE_SPECIAL.exec(s);
-    const j = m === null ? n : m.index;
-    if (j >= n) break;
+    if (m === null) break;
+    const j = m.index;
     const c = s[j];
     if (c === '`') {
       const k = s.indexOf('`', j + 1);
@@ -546,7 +566,8 @@ function inline(s, cx, dir, srcPath) {
         const k = findUnescaped(s, '**', j + 2);
         if (k > j + 2) {
           if (j > plain) out.push(s.slice(plain, j));
-          out.push('<strong>', inline(s.slice(j + 2, k), cx, dir, srcPath), '</strong>');
+          const inner = s.slice(j + 2, k);
+          out.push('<strong>', INLINE_TEST.test(inner) ? inline(inner, cx, dir, srcPath) : inner, '</strong>');
           i = k + 2;
           plain = i;
           continue;
@@ -557,7 +578,8 @@ function inline(s, cx, dir, srcPath) {
       const k = findSingleStar(s, j + 1);
       if (k > j + 1) {
         if (j > plain) out.push(s.slice(plain, j));
-        out.push('<em>', inline(s.slice(j + 1, k), cx, dir, srcPath), '</em>');
+        const inner = s.slice(j + 1, k);
+        out.push('<em>', INLINE_TEST.test(inner) ? inline(inner, cx, dir, srcPath) : inner, '</em>');
         i = k + 1;
         plain = i;
         continue;
@@ -571,7 +593,8 @@ function inline(s, cx, dir, srcPath) {
       const target = mm === -1 ? '' : s.slice(k + 2, mm);
       if (target !== '' && !hasWS(target)) {
         if (j > plain) out.push(s.slice(plain, j));
-        out.push('<a href="', esc(linkTarget(target, cx, dir, srcPath)), '">', inline(s.slice(j + 1, k), cx, dir, srcPath), '</a>');
+        const inner = s.slice(j + 1, k);
+        out.push('<a href="', esc(linkTarget(target, cx, dir, srcPath)), '">', INLINE_TEST.test(inner) ? inline(inner, cx, dir, srcPath) : inner, '</a>');
         i = mm + 1;
         plain = i;
         continue;
@@ -594,6 +617,9 @@ function inline(s, cx, dir, srcPath) {
     i = j + 1;
     plain = i;
   }
+  // Nothing was emitted: no markup matched and no escapable character was
+  // met, so the input is the output (plain only moves with an emission).
+  if (out.length === 0) return s;
   if (n > plain) out.push(s.slice(plain, n));
   return out.join('');
 }
@@ -633,7 +659,9 @@ function renderMarkdown(src, cx, dir, srcPath) {
         while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
         i++;
         const cls = fl === '' ? '' : ` class="language-${esc(fl)}"`;
-        blocks.push(`<pre><code${cls}>${body.map((l) => `${esc(l)}\n`).join('')}</code></pre>`);
+        // One escape over the joined body: "\n" is never escaped, so this
+        // is the per-line escapes joined with the same newlines.
+        blocks.push(`<pre><code${cls}>${body.length === 0 ? '' : `${esc(body.join('\n'))}\n`}</code></pre>`);
         continue;
       }
     } else if (c0 === 35) {
@@ -658,14 +686,14 @@ function renderMarkdown(src, cx, dir, srcPath) {
         while (i < n) {
           const m = bulletOf(lines[i]);
           if (m !== null) {
-            items.push([trimLine(m)]);
+            items.push(trimLine(m));
             i++;
           } else if (isContinued(lines[i])) {
-            items[items.length - 1].push(trimLine(lines[i]));
+            items[items.length - 1] += `\n${trimLine(lines[i])}`;
             i++;
           } else break;
         }
-        blocks.push(`<ul>\n${items.map((item) => `<li>${inline(item.join('\n'), cx, dir, srcPath)}</li>\n`).join('')}</ul>`);
+        blocks.push(`<ul>\n${items.map((item) => `<li>${inline(item, cx, dir, srcPath)}</li>\n`).join('')}</ul>`);
         continue;
       }
     } else if (c0 === 62) {
@@ -684,15 +712,15 @@ function renderMarkdown(src, cx, dir, srcPath) {
         while (i < n) {
           const m = orderedOf(lines[i]);
           if (m !== null) {
-            items.push([trimLine(m.text)]);
+            items.push(trimLine(m.text));
             i++;
           } else if (isContinued(lines[i])) {
-            items[items.length - 1].push(trimLine(lines[i]));
+            items[items.length - 1] += `\n${trimLine(lines[i])}`;
             i++;
           } else break;
         }
         const open = o.start !== 1 ? `<ol start="${o.start}">` : '<ol>';
-        blocks.push(`${open}\n${items.map((item) => `<li>${inline(item.join('\n'), cx, dir, srcPath)}</li>\n`).join('')}</ol>`);
+        blocks.push(`${open}\n${items.map((item) => `<li>${inline(item, cx, dir, srcPath)}</li>\n`).join('')}</ol>`);
         continue;
       }
     }
@@ -705,7 +733,7 @@ function renderMarkdown(src, cx, dir, srcPath) {
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : `${blocks.join('\n')}\n`, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -876,6 +904,7 @@ function parseTemplate(name, src) {
  * plain objects linked by prototype: the nearest binding wins, and each
  * further name must be an own property of the value so far. */
 function getx(S, path) {
+  if (path.length === 1) return S[path[0]];
   let v = S[path[0]];
   if (v === undefined) return undefined;
   for (let k = 1; k < path.length; k++) {
@@ -883,6 +912,104 @@ function getx(S, path) {
     v = v[path[k]];
   }
   return v;
+}
+
+/**
+ * Every root name a template's nodes read, per template, with includes
+ * followed to a fixpoint: a root a `for` binds inside a template (its
+ * variable, and `loop`) counts as bound there, and a root an included
+ * template reads counts as read here unless the caller binds it. The
+ * fixpoint loop, not a single pass, so a cycle of includes still closes.
+ */
+function templateFreeVars(parsed) {
+  const own = new Map();
+  const incs = new Map();
+  for (const [name, nodes] of parsed) {
+    const roots = new Set();
+    const included = new Set();
+    const walk = (ns, bound) => {
+      for (const n of ns) {
+        if (n.kind === 'text') continue;
+        if (n.kind === 'var' || n.kind === 'raw' || n.kind === 'if') {
+          if (!bound.has(n.path[0])) roots.add(n.path[0]);
+          if (n.kind === 'if') {
+            walk(n.then, bound);
+            if (n.else !== null) walk(n.else, bound);
+          }
+        } else if (n.kind === 'for') {
+          if (!bound.has(n.path[0])) roots.add(n.path[0]);
+          const b2 = new Set(bound);
+          b2.add(n.name);
+          b2.add('loop');
+          walk(n.body, b2);
+        } else if (n.kind === 'include') included.add(n.name);
+      }
+    };
+    walk(nodes, new Set());
+    own.set(name, roots);
+    incs.set(name, included);
+  }
+  const free = new Map([...own].map(([k, v]) => [k, new Set(v)]));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, set] of free) {
+      for (const inc of incs.get(name) ?? []) {
+        const f = free.get(inc);
+        if (f === undefined) continue;
+        for (const r of f) {
+          if (!set.has(r)) {
+            set.add(r);
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+  return free;
+}
+
+/**
+ * How a template may be memoised when included, from its free roots:
+ * - "case": it reads only the build's own roots (site, tags, recent), none
+ *   of them ever bound by a `for` anywhere, so one render per case (and
+ *   depth) serves every include of it.
+ * - "obj": it reads those roots plus exactly one other root, so its output
+ *   is a function of that root's object: one render per (depth, object).
+ * - "none": anything else (two free roots, or a root `loop` reads, whose
+ *   record is a fresh object per iteration) renders every time.
+ * A root a `for` binds anywhere is shadowed: it can resolve to a loop
+ * value instead of the build's own value, so a memo that does not key on
+ * it must not trust it.
+ */
+function classifyTemplates(parsed) {
+  const free = templateFreeVars(parsed);
+  const shadowed = new Set(['loop']);
+  const collectFors = (ns) => {
+    for (const n of ns) {
+      if (n.kind === 'for') {
+        shadowed.add(n.name);
+        collectFors(n.body);
+      } else if (n.kind === 'if') {
+        collectFors(n.then);
+        if (n.else !== null) collectFors(n.else);
+      }
+    }
+  };
+  for (const nodes of parsed.values()) collectFors(nodes);
+  const BASE = new Set(['site', 'tags', 'recent']);
+  const memo = new Map();
+  for (const [name, roots] of free) {
+    const nonBase = [...roots].filter((r) => !BASE.has(r));
+    if (nonBase.length === 0) {
+      memo.set(name, [...roots].every((r) => !shadowed.has(r)) ? { kind: 'case' } : { kind: 'none' });
+    } else if (nonBase.length === 1 && nonBase[0] !== 'loop') {
+      const r = nonBase[0];
+      const rest = [...roots].filter((x) => x !== r);
+      memo.set(name, rest.every((x) => BASE.has(x) && !shadowed.has(x)) ? { kind: 'obj', root: r } : { kind: 'none' });
+    } else memo.set(name, { kind: 'none' });
+  }
+  return memo;
 }
 
 /** A value as text: a string itself, a number in JavaScript's digits, true or false, an array's items joined by ", ", else "". */
@@ -902,7 +1029,7 @@ function truthy(v) {
 
 /** `nodes` rendered into `out` in scope `S`; `T` maps names to render
  * functions (compiled, or this interpreter where compiling failed). */
-function renderNodes(nodes, S, T, depth, out) {
+function renderNodes(nodes, S, T, depth, out, cx) {
   for (let ni = 0; ni < nodes.length; ni++) {
     const n = nodes[ni];
     switch (n.kind) {
@@ -918,7 +1045,7 @@ function renderNodes(nodes, S, T, depth, out) {
       case 'if': {
         const v = truthy(getx(S, n.path));
         const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) renderNodes(branch, S, T, depth, out);
+        if (branch !== null) renderNodes(branch, S, T, depth, out, cx);
         break;
       }
       case 'for': {
@@ -928,13 +1055,51 @@ function renderNodes(nodes, S, T, depth, out) {
         for (let k = 0; k < xs.length; k++) {
           child[n.name] = xs[k];
           child.loop = { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length };
-          renderNodes(n.body, child, T, depth, out);
+          renderNodes(n.body, child, T, depth, out, cx);
         }
         break;
       }
       case 'include': {
         const f = T.get(n.name);
-        if (f !== undefined && depth < 8) f(out, S, T, null, depth + 1);
+        if (f === undefined || depth >= 8) break;
+        const m = cx.tplMemo.get(n.name);
+        if (m === undefined || m.kind === 'none') {
+          f(out, S, T, null, depth + 1);
+          break;
+        }
+        // A memoised include renders into a side array once and the joined
+        // string is reused; the direct path above is kept for the rest.
+        if (m.kind === 'case') {
+          const key = `${n.name}\0${depth + 1}`;
+          let hit = cx.memoCase.get(key);
+          if (hit === undefined) {
+            const sub = [];
+            f(sub, S, T, null, depth + 1);
+            hit = sub.join('');
+            cx.memoCase.set(key, hit);
+          }
+          out.push(hit);
+        } else {
+          const keyObj = S[m.root];
+          if (keyObj === null || typeof keyObj !== 'object') {
+            f(out, S, T, null, depth + 1);
+            break;
+          }
+          const key = `${n.name}\0${depth + 1}`;
+          let wm = cx.memoObj.get(key);
+          if (wm === undefined) {
+            wm = new WeakMap();
+            cx.memoObj.set(key, wm);
+          }
+          let hit = wm.get(keyObj);
+          if (hit === undefined) {
+            const sub = [];
+            f(sub, S, T, null, depth + 1);
+            hit = sub.join('');
+            wm.set(keyObj, hit);
+          }
+          out.push(hit);
+        }
         break;
       }
     }
@@ -963,7 +1128,10 @@ function cardOf(s, cx) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    // The tag objects themselves: templates read only name, slug and url
+    // off a card's tags, which these carry (their extra `posts` is never
+    // read there), so no per-card copies are made.
+    tags: s.tagRefs,
   };
 }
 
@@ -986,6 +1154,7 @@ export function run(input) {
   const cx = {
     slugCache: new Map(),
     dateCache: new Map(),
+    linkCache: new Map(),
     broken: new Set(),
     bySource: new Map(),
     staticPaths: new Set(),
@@ -993,11 +1162,11 @@ export function run(input) {
   };
   const report = [];
 
-  // Templates, parsed in code-unit order of name and compiled to render
-  // functions; one that does not parse is reported and left out, as if it
-  // were not there. A template that cannot be compiled renders through the
-  // interpreter instead, with the same scope chain.
-  const templates = new Map();
+  // Templates, parsed in code-unit order of name; one that does not parse
+  // is reported and left out, as if it were not there. Then each parsed
+  // template is classified for include memoisation (case-constant, or a
+  // function of one root object), and the render functions are built.
+  const parsed = new Map();
   for (const name of Object.keys(input.templates).sort(byCU)) {
     let nodes;
     try {
@@ -1007,7 +1176,14 @@ export function run(input) {
       report.push(err.message);
       continue;
     }
-    templates.set(name, (out, S, T, H, d) => renderNodes(nodes, S, T, d, out));
+    parsed.set(name, nodes);
+  }
+  cx.tplMemo = classifyTemplates(parsed);
+  cx.memoCase = new Map();
+  cx.memoObj = new Map();
+  const templates = new Map();
+  for (const [name, nodes] of parsed) {
+    templates.set(name, (out, S, T, H, d) => renderNodes(nodes, S, T, d, out, cx));
   }
 
   // Sources, in code-unit order of path; ".md" is a source, the rest static.
@@ -1015,7 +1191,8 @@ export function run(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    // Most files hold no "\r": the replace is skipped outright then.
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -1140,15 +1317,17 @@ export function run(input) {
   baseScope.site = site;
   baseScope.tags = allTags;
   baseScope.recent = recent;
+  // One scope object reused for every render: the previous render's own
+  // values are cleared to undefined first, which reads exactly as absent
+  // (getx returns undefined either way, and nothing enumerates a scope).
+  const top = Object.create(baseScope);
+  let topKeys = [];
   const render = (name, vars) => {
     const fn = templates.get(name);
     if (fn === undefined) return null;
     const out = [];
-    // A scope with no prototype: a template name that is not bound reads
-    // as undefined, never as something off Object.prototype. site, tags
-    // and recent are shared on the chain's root; only the page's own
-    // values are set per render.
-    const top = Object.create(baseScope);
+    for (const k of topKeys) top[k] = undefined;
+    topKeys = Object.keys(vars);
     Object.assign(top, vars);
     fn(out, top, templates, null, 0);
     return out.join('');
